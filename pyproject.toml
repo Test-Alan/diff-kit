@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "diff-kit"
+version = "0.1.0"
+description = ""
+authors = ["280262569@qq.com"]
+readme = "README.md"
+packages = [{include = "diff_kit"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+typer = "^0.9.0"
+rich = "^13.7.0"
+dictdiffer = "^0.9.0"
+loguru = "^0.7.2"
+aiomysql = "^0.2.0"
+pyyaml = "^6.0.1"
+motor = "^3.4.0"
+tqdm = "^4.66.4"
+asyncpg = "^0.29.0"
+pandas = "^2.2.2"
+openpyxl = "^3.1.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

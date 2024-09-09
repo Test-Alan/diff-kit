@@ -1,0 +1,15 @@
+# JetBrains IDE files.
+/.idea
+
+# Built packages.
+/dist
+/build
+# Python virtual environment.
+/venv
+/test
+/.venv
+__pycache__
+logs
+output
+poetry.lock
+popt.py
