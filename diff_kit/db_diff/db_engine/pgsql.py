@@ -45,9 +45,11 @@ class AsyncPgEngine(DbEngine):
             return await conn.fetch(query_sql, *values) if values else await conn.fetch(query_sql)
 
     @handle_db_exception
-    async def query_in(self, columns, table_name, query_data: dict):
+    async def query_in(self, columns, table_name, query_data: dict, extend: str = None):
         query_sql = f"SELECT {columns} FROM {table_name} "
         where_clause = "WHERE " + ' AND '.join([f"{k} IN {tuple(v)}" for k, v in query_data.items()])
+        if extend:
+            where_clause += " AND " + extend
         query_sql += where_clause
 
         async with self.pool.acquire() as conn:

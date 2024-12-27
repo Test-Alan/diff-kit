@@ -60,9 +60,11 @@ class AsyncMysqlDbEngine(DbEngine):
                 return await cur.fetchall()
 
     @handle_db_exception
-    async def query_in(self, columns, table_name, query_data: dict) -> dict:
+    async def query_in(self, columns, table_name, query_data: dict, extend: str = None) -> dict:
         query_sql = f"SELECT {columns} FROM {table_name} "
         where_clause = "WHERE " + ' AND '.join([f"{k} IN %s" for k in query_data.keys()])
+        if extend:
+            where_clause += " AND " + extend
         values = [tuple(v) for v in query_data.values()]
         query_sql += where_clause
         async with self.pool.acquire() as conn:

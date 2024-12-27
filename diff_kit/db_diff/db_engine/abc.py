@@ -16,7 +16,7 @@ class DbEngine(metaclass=abc.ABCMeta):
         self.pool = None
 
     @abc.abstractmethod
-    def create_pool(self):
+    def create_pool(self, *args, **kwargs):
         pass
 
     @abc.abstractmethod

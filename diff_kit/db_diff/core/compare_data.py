@@ -12,13 +12,14 @@ from collections import defaultdict
 from tqdm.asyncio import tqdm as tqdm_async
 from typing import Union, List, Dict, Any, Optional, Callable
 from diff_kit.db_diff.core.results import Result
-from diff_kit.db_diff.db_engine import get_db_engine
+from diff_kit.db_diff.db_engine import DbEngineFactory
 from diff_kit.utils.logger import logger
 
 console = Console()
 
 
 class DbConfig(BaseModel):
+    db_type: str
     host: str
     port: int
     user: str
@@ -26,21 +27,22 @@ class DbConfig(BaseModel):
 
 
 class DiffParams(BaseModel):
-    db_type: str
     db_conn_a: DbConfig
     db_conn_b: Optional[DbConfig] = None
     db_name_a: str
     db_name_b: str
     table_name_a: str
     table_name_b: str
-    query_condition_a: Optional[str] = None
-    query_condition_b: Optional[Union[list, dict, str]] = None
-    diff_columns: Optional[list] = []
-    exclude_columns: Optional[list] = []
-    mapping: Optional[dict] = {}
+    where_clause_a: Optional[str] = None
+    where_clause_b: Optional[str] = None
+    field_mapping: Optional[dict] = None
+    unique_field: Union[list, dict]
+    diff_columns: Optional[list] = None
+    exclude_columns: Optional[list] = None
     limit: int = 1000
     maxsize: int = 50
     compare_count: bool = False
+    fast: bool = True
     plugin: Optional[Callable] = None
 
 
@@ -67,9 +69,18 @@ class DbDiff:
             self.kwargs.db_name_b = self.kwargs.db_name_a
 
         try:
-            db_engine = get_db_engine(self.kwargs.db_type)
-            self.client_a = db_engine(**self.kwargs.db_conn_a.dict(), db=self.kwargs.db_name_a)
-            self.client_b = db_engine(**self.kwargs.db_conn_b.dict(), db=self.kwargs.db_name_b)
+            db_conn_config_a = self.kwargs.db_conn_a.model_dump(exclude={'db_type'})
+            db_conn_config_b = self.kwargs.db_conn_b.model_dump(exclude={'db_type'})
+            self.client_a = DbEngineFactory(
+                self.kwargs.db_conn_a.db_type,
+                db=self.kwargs.db_name_a,
+                **db_conn_config_a
+            ).create_db_engine()
+            self.client_b = DbEngineFactory(
+                self.kwargs.db_conn_b.db_type,
+                db=self.kwargs.db_name_b,
+                **db_conn_config_b
+            ).create_db_engine()
             # 创建数据库连接池
             await self.client_a.create_pool(self.kwargs.maxsize)
             await self.client_b.create_pool(self.kwargs.maxsize)
@@ -90,9 +101,9 @@ class DbDiff:
         @param method: 处理方式，默认为'alias'。可选值为'alias'和'replace'。
         @return: 处理后的列名列表。
         """
-        columns_mapping = self.kwargs.mapping
+        field_mapping = self.kwargs.field_mapping
         # 判断映射是否为空，如果为空，直接返回差异列列表
-        if columns_mapping is None:
+        if field_mapping is None:
             return columns
 
         # 检查处理方式是否有效
@@ -101,11 +112,11 @@ class DbDiff:
 
         # 为每个列名添加as别名（如果在映射中存在）
         if method == 'alias':
-            return [col + f' as {columns_mapping.get(col)}' if columns_mapping.get(col) else col for col in columns]
+            return [col + f' as {field_mapping.get(col)}' if field_mapping.get(col) else col for col in columns]
 
         # 使用映射中的值替换列名（如果存在映射）
         if method == 'replace':
-            return [columns_mapping.get(col, col) for col in columns]
+            return [field_mapping.get(col, col) for col in columns]
 
     def _join_query_columns(self, query_columns: list):
         """
@@ -126,29 +137,37 @@ class DbDiff:
         """
         return ' AND '.join(where_clause)
 
-    def _parse_query_condition_b(self, row_a: dict):
+    def _parse_where_clause_b(self, row_a: dict):
         # 根据字段值的类型生成相应的查询条件字符串。
         def check_type(k, v, sign='='):
             if isinstance(v, int) or isinstance(v, float):
                 return f"{k} {sign} {v}"
-            elif v is None:
+            if v is None:
                 return f"{k} IS NULL"
-            else:
-                return f"{k} {sign} '{str(v)}'"
+            if v == '':
+                return f"{k} {sign} ''"
 
-        if isinstance(self.kwargs.query_condition_b, dict):
-            return self._join_where_clause([check_type(column_b, row_a[column_a]) for column_a, column_b in
-                                            self.kwargs.query_condition_b.items()])
+            return f"{k} {sign} '{str(v)}'"
 
-        if isinstance(self.kwargs.query_condition_b, list):
-            return self._join_where_clause(
-                [check_type(column_a, row_a[column_a]) for column_a in self.kwargs.query_condition_b])
+        if isinstance(self.kwargs.unique_field, dict):
+            expression = [check_type(field_b, row_a[field_a]) for field_a, field_b in self.unique_field.items()]
+
+        elif isinstance(self.kwargs.unique_field, list):
+            expression = [check_type(field, row_a[field]) for field in self.kwargs.unique_field]
+
+        else:
+            raise TypeError("unique_field must be a dict or a list")
+
+        if self.kwargs.where_clause_b:
+            expression.append(self.kwargs.where_clause_b)
+
+        return ' AND '.join(expression)
 
     def _parse_query_condition_in_b(self, result_a):
         """
         根据查询条件解析来自结果A的条件并生成适用于B的批量查询条件
 
-        此函数的作用是根据预设的查询条件(self.query_condition_b)将结果A(list of dicts)中的特定字段
+        此函数的作用是根据预设的查询条件(self.where_clause_b)将结果A(list of dicts)中的特定字段
         提取出来，形成一个新的查询条件字典(batch_where_clause_b)，该字典用于后续对数据源B的查询。
         同时，该函数会返回一个包含所有查询键的列表(keys)。
 
@@ -160,17 +179,17 @@ class DbDiff:
             keys_a.append(ka)
             keys_b.append(kb)
 
-        # 确认query_condition_b是字典还是列表
-        if isinstance(self.kwargs.query_condition_b, dict):
-            for ka, kb in self.kwargs.query_condition_b.items():
+        # 确认where_clause_b是字典还是列表
+        if isinstance(self.kwargs.unique_field, dict):
+            for ka, kb in self.kwargs.unique_field.items():
                 add_batch_where_clause(ka, kb, result_a)
 
         # 如果查询条件是列表，遍历其元素
-        elif isinstance(self.kwargs.query_condition_b, list):
-            for k in self.kwargs.query_condition_b:
+        elif isinstance(self.kwargs.unique_field, list):
+            for k in self.kwargs.unique_field:
                 add_batch_where_clause(k, k, result_a)
         else:
-            raise TypeError("query_condition_b must be a dict or a list")
+            raise TypeError("unique_field must be a dict or a list")
 
         return keys_a, keys_b, batch_where_clause_b
 
@@ -197,17 +216,17 @@ class DbDiff:
         :param is_use_query_condition: 是否使用查询条件
         :return:
         """
-        query_condition_a = self.kwargs.query_condition_a
-        query_condition_b = self.kwargs.query_condition_b
+        where_clause_a = self.kwargs.where_clause_a
+        where_clause_b = self.kwargs.where_clause_b
 
         # 如果不使用查询条件，则将查询条件置为None
         if not is_use_query_condition:
-            query_condition_a = None
-            query_condition_b = None
+            where_clause_a = None
+            where_clause_b = None
 
         return await asyncio.gather(
-            self.client_a.get_row_count(self.kwargs.table_name_a, query_condition_a),
-            self.client_b.get_row_count(self.kwargs.table_name_b, query_condition_b)
+            self.client_a.get_row_count(self.kwargs.table_name_a, where_clause_a),
+            self.client_b.get_row_count(self.kwargs.table_name_b, where_clause_b)
         )
 
     async def distribute_run_tasks(self, task_name, total_tasks, batch_size, maxsize):
@@ -223,7 +242,10 @@ class DbDiff:
 
         async def task(pbar, start_index, batch_size):
             async with semaphore:
-                await self.compare_data_batch(pbar, start_index, batch_size)
+                if self.kwargs.fast:
+                    await self.compare_data_batch(pbar, start_index, batch_size)
+                else:
+                    await self.compare_data(pbar, start_index, batch_size)
 
         with tqdm_async(total=total_tasks, desc=task_name, unit="row", ncols=160) as pbar:
             tasks = [task(pbar, start_index * batch_size, batch_size)
@@ -273,8 +295,8 @@ class DbDiff:
                               num_table_b=table_b_total_num)
 
         diff_row_count = table_a_total_num
-        if self.kwargs.query_condition_a:
-            diff_row_count = await self.client_a.get_row_count(self.kwargs.table_name_a, self.kwargs.query_condition_a)
+        if self.kwargs.where_clause_a:
+            diff_row_count = await self.client_a.get_row_count(self.kwargs.table_name_a, self.kwargs.where_clause_a)
 
         name = f"Task 比较两个表，基础表为: {self.kwargs.table_name_a}, 对比表为: {self.kwargs.table_name_b}"
         await self.distribute_run_tasks(name, diff_row_count, self.kwargs.limit, self.kwargs.maxsize)
@@ -286,7 +308,7 @@ class DbDiff:
         query_a_result = await self.client_a.query(
             self.query_columns_a,
             self.kwargs.table_name_a,
-            self.kwargs.query_condition_a,
+            self.kwargs.where_clause_a,
             start_index,
             batch_size
         )
@@ -296,7 +318,8 @@ class DbDiff:
         query_b_result = await self.client_b.query_in(
             self.query_columns_b,
             self.kwargs.table_name_b,
-            batch_where_clause_b
+            batch_where_clause_b,
+            self.kwargs.where_clause_b
         )
 
         # 将数据源B的查询结果转换为字典形式
@@ -330,11 +353,11 @@ class DbDiff:
         async for row_a in self.client_a.execute_query_generator(
                 self.query_columns_a,
                 self.kwargs.table_name_a,
-                self.kwargs.query_condition_a,
+                self.kwargs.where_clause_a,
                 start_index,
                 batch_size
         ):
-            where_clause_b = self._parse_query_condition_b(row_a)
+            where_clause_b = self._parse_where_clause_b(row_a)
             row_b = await self.client_b.execute_query(self.query_columns_b, self.table_name_b, where_clause_b)
             await self.compare_row(row_a, row_b, where_clause_b)
             pbar.update(1)
